@@ -109,15 +109,22 @@ function init(github, owner, repo, config, core) {
           `(expected one of: prefix, suffix, exact, pattern)`
         );
       }
-      return { label: rule.label, test };
+      return { label: rule.label, test, skipExcluded: !!rule.skipExcludedFiles };
     });
   }
 
   function matchFileLabels(files, fileRules) {
     const rules = fileRules || buildFileRules();
+    const excluded = new Set(excludedFiles);
     const labels = new Set();
     for (const rule of rules) {
-      if (files.some(f => rule.test(f.filename ?? ''))) {
+      // skipExcluded: ignore files whose basename is in the top-level
+      // "excludedFiles" list (e.g. uv.lock) so lockfile-only changes
+      // don't trigger package labels.
+      const candidates = rule.skipExcluded
+        ? files.filter(f => !excluded.has((f.filename ?? '').split('/').pop()))
+        : files;
+      if (candidates.some(f => rule.test(f.filename ?? ''))) {
         labels.add(rule.label);
       }
     }
@@ -245,6 +252,38 @@ function init(github, owner, repo, config, core) {
     return tierLabel;
   }
 
+  // ── Full PR labeling (title + file + size) ───────────────────────
+
+  async function labelPR(prNumber, { title } = {}) {
+    if (!prNumber) {
+      throw new Error('labelPR() requires a valid prNumber');
+    }
+    const toAdd = new Set();
+
+    const prTitle = title ?? (await github.rest.pulls.get({
+      owner, repo, pull_number: prNumber,
+    })).data.title;
+
+    // Title-based labels
+    for (const l of matchTitleLabels(prTitle).labels) toAdd.add(l);
+
+    // File-based labels + size
+    const files = await github.paginate(github.rest.pulls.listFiles, {
+      owner, repo, pull_number: prNumber, per_page: 100,
+    });
+    toAdd.add(computeSize(files).sizeLabel);
+    for (const l of matchFileLabels(files)) toAdd.add(l);
+
+    for (const name of toAdd) await ensureLabel(name);
+    const labels = [...toAdd];
+    if (labels.length) {
+      await github.rest.issues.addLabels({
+        owner, repo, issue_number: prNumber, labels,
+      });
+    }
+    return labels;
+  }
+
   return {
     ensureLabel,
     getSizeLabel,
@@ -252,6 +291,7 @@ function init(github, owner, repo, config, core) {
     buildFileRules,
     matchFileLabels,
     matchTitleLabels,
+    labelPR,
     allTypeLabels,
     checkMembership,
     getContributorInfo,
