@@ -29,7 +29,7 @@ from deepagents.backends import FilesystemBackend
 backend = FilesystemBackend(root_dir="/data")
 
 summ = SummarizationMiddleware(
-    model="gpt-4o-mini",
+    model="gpt-5.4-mini",
     backend=backend,
     trigger=("fraction", 0.85),
     keep=("fraction", 0.10),
@@ -54,7 +54,7 @@ import logging
 import uuid
 import warnings
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Annotated, Any, NotRequired, cast
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, NotRequired, cast
 
 from langchain.agents.middleware.summarization import (
     _DEFAULT_MESSAGES_TO_KEEP,
@@ -70,11 +70,13 @@ from langchain_core.exceptions import ContextOverflowError
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage, get_buffer_string
 from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.config import get_config
-from langgraph.types import Command
+from langgraph.types import Command, Overwrite
 from pydantic import BaseModel
 from typing_extensions import TypedDict
 
+from deepagents._api.deprecation import warn_deprecated
 from deepagents.backends import CompositeBackend
+from deepagents.middleware._overflow_clip import _aclip_overflow_tail, _clip_overflow_tail
 from deepagents.middleware._utils import append_to_system_message
 
 if TYPE_CHECKING:
@@ -211,6 +213,22 @@ class _DeepAgentsSummarizationMiddleware(AgentMiddleware):
     """Summarization middleware with backend for conversation history offloading."""
 
     state_schema = SummarizationState
+    serialized_name: ClassVar[str] = "SummarizationMiddleware"
+    """Preferred config-file reference for class-form exclusion export."""
+
+    @property
+    def name(self) -> str:
+        """Report the public `SummarizationMiddleware` alias for string-form exclusion.
+
+        The impl class is private (`_DeepAgentsSummarizationMiddleware`) but
+        ships under the public `SummarizationMiddleware` name, so
+        `excluded_middleware={"SummarizationMiddleware"}` targets this class.
+        Subclasses fall back to `type(self).__name__` so user-authored
+        extensions don't silently inherit the alias.
+        """
+        if type(self) is _DeepAgentsSummarizationMiddleware:
+            return "SummarizationMiddleware"
+        return type(self).__name__
 
     def __init__(
         self,
@@ -260,7 +278,7 @@ class _DeepAgentsSummarizationMiddleware(AgentMiddleware):
             from deepagents.backends import StateBackend
 
             middleware = SummarizationMiddleware(
-                model="gpt-4o-mini",
+                model="gpt-5.4-mini",
                 backend=StateBackend(),
                 trigger=("tokens", 100000),
                 keep=("messages", 20),
@@ -269,12 +287,16 @@ class _DeepAgentsSummarizationMiddleware(AgentMiddleware):
         """
         _deprecated_history_prefix = deprecated_kwargs.pop("history_path_prefix", None)
         if _deprecated_history_prefix is not None:
-            warnings.warn(
-                "The argument `history_path_prefix` was deprecated in deepagents 0.5"
-                " and will be removed in 0.7."
-                " Use CompositeBackend(artifacts_root='/my/root', ...) instead.",
-                DeprecationWarning,
-                stacklevel=2,
+            warn_deprecated(
+                since="0.5.0",
+                removal="0.7.0",
+                message=(
+                    "The argument `history_path_prefix` is deprecated and "
+                    "will be removed in deepagents==0.7.0. Use "
+                    "`CompositeBackend(artifacts_root='/my/root', ...)` "
+                    "instead."
+                ),
+                package="deepagents",
             )
 
         # Initialize langchain helper for core summarization logic
@@ -294,6 +316,7 @@ class _DeepAgentsSummarizationMiddleware(AgentMiddleware):
         artifacts_root = backend.artifacts_root if isinstance(backend, CompositeBackend) else "/"
         _root = artifacts_root.rstrip("/")
         self._history_path_prefix = f"{_root}/conversation_history"
+        self._large_tool_results_prefix = f"{_root}/large_tool_results"
 
         if _deprecated_history_prefix is not None:
             self._history_path_prefix = _deprecated_history_prefix
@@ -936,11 +959,12 @@ A condensed summary follows:
         should_summarize = self._should_summarize(truncated_messages, total_tokens)
 
         # If no summarization needed, return with truncated messages
+        overflow_triggered = False
         if not should_summarize:
             try:
                 return handler(request.override(messages=truncated_messages))
             except ContextOverflowError:
-                pass
+                overflow_triggered = True
                 # Fallback to summarization on context overflow
 
         # Step 3: Perform summarization
@@ -951,9 +975,21 @@ A condensed summary follows:
 
         messages_to_summarize, preserved_messages = self._partition_messages(truncated_messages, cutoff_index)
 
+        backend = self._get_backend(request.state, request.runtime)
+        # On overflow, offload the large preserved tail TM batch to per-TM files.
+        new_state_tail: list[AnyMessage] = []
+        if overflow_triggered:
+            preserved_messages, new_state_tail = _clip_overflow_tail(
+                preserved_messages,
+                backend,
+                keep=self._lc_helper.keep,
+                max_input_tokens=self._get_profile_limits(),
+                token_counter=self.token_counter,
+                large_tool_results_prefix=self._large_tool_results_prefix,
+            )
+
         # Offload to backend first so history is preserved before summarization.
         # If offload fails, summarization still proceeds (with file_path=None).
-        backend = self._get_backend(request.state, request.runtime)
         file_path = self._offload_to_backend(backend, messages_to_summarize)
         if file_path is None:
             msg = "Offloading conversation history to backend failed during summarization. Older messages will not be recoverable."
@@ -980,10 +1016,20 @@ A condensed summary follows:
         modified_messages = [*new_messages, *preserved_messages]
         response = handler(request.override(messages=modified_messages))
 
+        # Persist the clipped tail into state via Overwrite. Match the
+        # pattern from filesystem.py: atomically replace the messages channel
+        # so the clipped TMs survive DeltaChannel replay (append + reducer
+        # id-matching is broken until langchain-core auto-assigns ids upstream).
+        update: dict[str, Any] = {"_summarization_event": new_event}
+        if new_state_tail:
+            state_messages = list(request.state.get("messages", []))
+            new_state_messages = [*state_messages[: len(state_messages) - len(new_state_tail)], *new_state_tail]
+            update["messages"] = Overwrite(new_state_messages)
+
         # Return ExtendedModelResponse with state update
         return ExtendedModelResponse(
             model_response=response,
-            command=Command(update={"_summarization_event": new_event}),
+            command=Command(update=update),
         )
 
     async def awrap_model_call(
@@ -1040,11 +1086,12 @@ A condensed summary follows:
         should_summarize = self._should_summarize(truncated_messages, total_tokens)
 
         # If no summarization needed, return with truncated messages
+        overflow_triggered = False
         if not should_summarize:
             try:
                 return await handler(request.override(messages=truncated_messages))
             except ContextOverflowError:
-                pass
+                overflow_triggered = True
                 # Fallback to summarization on context overflow
 
         # Step 3: Perform summarization
@@ -1055,9 +1102,21 @@ A condensed summary follows:
 
         messages_to_summarize, preserved_messages = self._partition_messages(truncated_messages, cutoff_index)
 
+        backend = self._get_backend(request.state, request.runtime)
+        # On overflow, offload the large preserved tail TM batch to per-TM files.
+        new_state_tail: list[AnyMessage] = []
+        if overflow_triggered:
+            preserved_messages, new_state_tail = await _aclip_overflow_tail(
+                preserved_messages,
+                backend,
+                keep=self._lc_helper.keep,
+                max_input_tokens=self._get_profile_limits(),
+                token_counter=self.token_counter,
+                large_tool_results_prefix=self._large_tool_results_prefix,
+            )
+
         # Offload to backend and generate summary concurrently -- they are independent.
         # If offload fails, summarization still proceeds (with file_path=None).
-        backend = self._get_backend(request.state, request.runtime)
         file_path, summary = await asyncio.gather(
             self._aoffload_to_backend(backend, messages_to_summarize),
             self._acreate_summary(messages_to_summarize),
@@ -1084,10 +1143,20 @@ A condensed summary follows:
         modified_messages = [*new_messages, *preserved_messages]
         response = await handler(request.override(messages=modified_messages))
 
+        # Persist the clipped tail into state via Overwrite. Match the
+        # pattern from filesystem.py: atomically replace the messages channel
+        # so the clipped TMs survive DeltaChannel replay (append + reducer
+        # id-matching is broken until langchain-core auto-assigns ids upstream).
+        update: dict[str, Any] = {"_summarization_event": new_event}
+        if new_state_tail:
+            state_messages = list(request.state.get("messages", []))
+            new_state_messages = [*state_messages[: len(state_messages) - len(new_state_tail)], *new_state_tail]
+            update["messages"] = Overwrite(new_state_messages)
+
         # Return ExtendedModelResponse with state update
         return ExtendedModelResponse(
             model_response=response,
-            command=Command(update={"_summarization_event": new_event}),
+            command=Command(update=update),
         )
 
 
@@ -1102,10 +1171,40 @@ def create_summarization_middleware(
     model: BaseChatModel,
     backend: BACKEND_TYPES,
 ) -> _DeepAgentsSummarizationMiddleware:
-    """Create a `SummarizationMiddleware` with model-aware defaults.
+    """Create a Deep Agents `SummarizationMiddleware` with model-aware defaults.
 
-    Computes trigger, keep, and truncation settings from the model's profile
-    (or uses fixed-token fallbacks) and returns a configured middleware.
+    ## Why this exists in `deepagents`
+
+    The Deep Agents `SummarizationMiddleware` wraps
+    `langchain.agents.middleware.SummarizationMiddleware` to add behavior
+    long-running, file-aware agents need. Prefer LangChain's middleware
+    directly if none of the below apply:
+
+    - **Backend offload of evicted history.** Evicted messages are appended
+        to `/conversation_history/{thread_id}.md` (default path) on the
+        configured backend before the summary replaces them, and the
+        summary embeds that path so the agent can re-open it via
+        `read_file` when `FilesystemMiddleware` is registered. LangChain
+        drops evicted messages with no recovery path.
+    - **Pre-summarization tool-arg truncation.** Large `write_file` /
+        `edit_file` arguments in older messages are clipped at a lower
+        threshold than full compaction, often reclaiming enough context
+        to skip summarizing. Configured via `truncate_args_settings`.
+    - **`ContextOverflowError` fallback.** On a provider over-budget
+        rejection the middleware summarizes and retries instead of
+        bubbling the error up.
+    - **Non-mutating message state.** Summarization is tracked in a
+        private `_summarization_event` field via `wrap_model_call`,
+        leaving `state["messages"]` intact. LangChain rewrites it with
+        `RemoveMessage(id=REMOVE_ALL_MESSAGES)` from `before_model`.
+        Preserving the raw log enables replay, evals, and shared state
+        with `SummarizationToolMiddleware`'s `compact_conversation` tool.
+    - **Auto-selected trigger/keep thresholds.** LangChain accepts
+        fraction-based thresholds but defaults to `trigger=None` and
+        `keep=("messages", 20)`. This factory picks fraction-based
+        defaults from the model's profile when `max_input_tokens` is
+        exposed, falling back to fixed counts otherwise — see
+        [`compute_summarization_defaults`][deepagents.middleware.summarization.compute_summarization_defaults].
 
     Args:
         model: Resolved `BaseChatModel` instance.
@@ -1142,12 +1241,33 @@ def create_summarization_tool_middleware(
 ) -> SummarizationToolMiddleware:
     """Create a `SummarizationToolMiddleware` with model-aware defaults.
 
-    Convenience factory that creates a `SummarizationMiddleware` via
-    `create_summarization_middleware` and wraps it in a
-    `SummarizationToolMiddleware`.
+    Convenience factory: builds a `SummarizationMiddleware` via
+    [`create_summarization_middleware`][deepagents.middleware.summarization.create_summarization_middleware]
+    and wraps it in a `SummarizationToolMiddleware`. Saves a step and
+    accepts a model string.
+
+    ## What you get
+
+    Only the tool layer is registered — the wrapped `SummarizationMiddleware`
+    is the engine the tool calls into, not a middleware that runs on its
+    own. The agent gains:
+
+    - A `compact_conversation` tool to compact its own context window
+    - A system-prompt nudge hinting when to call it
+    - An eligibility gate at ~50% of the auto-summarization trigger so
+        the tool refuses to compact too early
+
+    ## Pairing with auto-summarization
+
+    For *automatic* summarization at the trigger threshold, also register
+    a `SummarizationMiddleware`. `create_deep_agent` adds one by default,
+    so dropping `create_summarization_tool_middleware(...)` into its
+    `middleware=[...]` gives you both layers; they share state via the
+    `_summarization_event` key.
 
     Args:
-        model: Chat model instance or model string (e.g., `"anthropic:claude-sonnet-4-6"`).
+        model: Chat model instance, or a model string
+            (e.g. `"anthropic:claude-sonnet-4-6"`).
         backend: Backend instance or factory for persisting conversation history.
 
     Returns:
@@ -1230,7 +1350,7 @@ class SummarizationToolMiddleware(AgentMiddleware):
             SummarizationToolMiddleware,
         )
 
-        summ = SummarizationMiddleware(model="gpt-4o-mini", backend=backend)
+        summ = SummarizationMiddleware(model="gpt-5.4-mini", backend=backend)
         tool_mw = SummarizationToolMiddleware(summ)
 
         agent = create_deep_agent(middleware=[summ, tool_mw])
@@ -1239,14 +1359,31 @@ class SummarizationToolMiddleware(AgentMiddleware):
 
     state_schema = SummarizationState
 
-    def __init__(self, summarization: _DeepAgentsSummarizationMiddleware) -> None:
+    def __init__(
+        self,
+        summarization: _DeepAgentsSummarizationMiddleware,
+        *,
+        system_prompt: str | None = SUMMARIZATION_SYSTEM_PROMPT,
+    ) -> None:
         """Initialize with a reference to the summarization middleware.
 
         Args:
             summarization: The `SummarizationMiddleware` instance whose
                 summarization engine this tool will delegate to.
+            system_prompt: System-prompt fragment nudging the model to call
+                `compact_conversation`. Pass `None` to skip appending the
+                nudge entirely (the tool remains registered and callable
+                but the model is unlikely to discover it without an
+                external mention).
+
+        Raises:
+            TypeError: If `system_prompt` is not `str` or `None`.
         """
+        if system_prompt is not None and not isinstance(system_prompt, str):
+            msg = f"system_prompt must be str or None, got {type(system_prompt).__name__}"
+            raise TypeError(msg)
         self._summarization = summarization
+        self.system_prompt = system_prompt
         self.tools: list[BaseTool] = [self._create_compact_tool()]
 
     def _resolve_backend(self, runtime: ToolRuntime) -> BackendProtocol:
@@ -1511,7 +1648,9 @@ class SummarizationToolMiddleware(AgentMiddleware):
         Returns:
             The model response from the handler.
         """
-        new_system_message = append_to_system_message(request.system_message, SUMMARIZATION_SYSTEM_PROMPT)
+        if self.system_prompt is None:
+            return handler(request)
+        new_system_message = append_to_system_message(request.system_message, self.system_prompt)
         return handler(request.override(system_message=new_system_message))
 
     async def awrap_model_call(
@@ -1532,5 +1671,7 @@ class SummarizationToolMiddleware(AgentMiddleware):
         Returns:
             The model response from the handler.
         """
-        new_system_message = append_to_system_message(request.system_message, SUMMARIZATION_SYSTEM_PROMPT)
+        if self.system_prompt is None:
+            return await handler(request)
+        new_system_message = append_to_system_message(request.system_message, self.system_prompt)
         return await handler(request.override(system_message=new_system_message))

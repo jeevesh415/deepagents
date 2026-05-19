@@ -19,10 +19,7 @@ def _smoke_model() -> GenericFakeChatModel:
 
 
 def _system_message_as_text(message: SystemMessage) -> str:
-    content = message.content
-    if isinstance(content, str):
-        return content
-    return "\n".join(str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in content)
+    return str(message.text).rstrip("\n") + "\n"
 
 
 def _invoke_for_snapshot(agent: object, payload: dict[str, Any]) -> None:
@@ -39,13 +36,13 @@ def _invoke_for_snapshot(agent: object, payload: dict[str, Any]) -> None:
 
 def _assert_snapshot(snapshot_path: Path, actual: str, *, update_snapshots: bool) -> None:
     if update_snapshots or not snapshot_path.exists():
-        snapshot_path.write_text(actual)
+        snapshot_path.write_text(actual, encoding="utf-8")
         if update_snapshots:
             return
         msg = f"Created snapshot at {snapshot_path}. Re-run tests."
         raise AssertionError(msg)
 
-    expected = snapshot_path.read_text()
+    expected = snapshot_path.read_text(encoding="utf-8")
     assert actual == expected
 
 

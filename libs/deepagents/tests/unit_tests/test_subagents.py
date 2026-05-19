@@ -8,20 +8,26 @@ and child agents.
 import dataclasses
 import json
 import uuid
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TypedDict
+from unittest.mock import MagicMock
 
 import pytest
 from langchain.agents import create_agent
 from langchain.agents.middleware import TodoListMiddleware
 from langchain.agents.structured_output import ToolStrategy
 from langchain.tools import ToolRuntime
-from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.callbacks import BaseCallbackHandler, CallbackManagerForLLMRun
+from langchain_core.language_models import BaseChatModel, LanguageModelInput
 from langchain_core.messages import AIMessage, HumanMessage
-from langchain_core.runnables import RunnableConfig, RunnableLambda
-from langchain_core.tools import tool
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
+from langchain_core.tools import BaseTool, tool
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.graph import END, START, StateGraph
+from langgraph.graph import END, START, MessagesState, StateGraph
+from langsmith import Client
+from langsmith.run_helpers import tracing_context
 from pydantic import BaseModel, Field
 
 from deepagents.backends.filesystem import FilesystemBackend
@@ -42,6 +48,44 @@ description: {description}
 
 Instructions go here.
 """
+
+
+class _ScriptedChatModel(BaseChatModel):
+    """Fake chat model that returns a fixed scripted sequence of AIMessages.
+
+    Each call to `_generate` returns the next message in `responses`;
+    once exhausted, it repeats the final response. This avoids `StopIteration`
+    bugs that arise with plain iterators under langgraph's generator runner.
+    """
+
+    responses: list[AIMessage] = []  # noqa: RUF012  # Pydantic field, per-instance
+    tools: Sequence[dict[str, Any] | type | Callable | BaseTool] = ()
+    _call_idx: int = 0
+
+    @property
+    def _llm_type(self) -> str:
+        return "scripted"
+
+    def _generate(
+        self,
+        messages: Sequence[Any],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        idx = min(self._call_idx, len(self.responses) - 1)
+        self._call_idx += 1
+        return ChatResult(generations=[ChatGeneration(message=self.responses[idx])])
+
+    def bind_tools(
+        self,
+        tools: Sequence[dict[str, Any] | type | Callable | BaseTool],
+        *,
+        tool_choice: str | None = None,
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, AIMessage]:
+        self.tools = tools
+        return self
 
 
 class TestSubAgents:
@@ -644,7 +688,9 @@ class TestSubAgents:
         # Pregel merges the runtime recursion_limit patch with the subagent's own
         # config instead of replacing it wholesale.
         assert captured_config["tags"] == ["hello"]
-        assert captured_config["metadata"]["lc_agent_name"] == "subagent-runtime-check"
+        # CompiledSubAgent.name takes precedence over the name set in create_agent()
+        # so that lc_agent_name in streamed chunks reflects the declared subagent name.
+        assert captured_config["metadata"]["lc_agent_name"] == "general-purpose"
 
     def test_subagent_inherits_interrupt_on_from_parent_agent(self) -> None:
         interrupt_payloads: list[Any] = []
@@ -1321,6 +1367,66 @@ class TestSubAgents:
         task_tool_message = tool_messages[0]
         assert task_tool_message.content == "Plain text result without structured response"
 
+    def test_fallback_skips_trailing_empty_ai_message(self) -> None:
+        """Skip a trailing empty AIMessage and use the last AIMessage with text.
+
+        Anthropic/Bedrock occasionally emits an empty `end_turn` AIMessage after
+        a successful final tool call. The middleware should walk back to the
+        prior AIMessage carrying the real answer instead of forwarding an empty
+        ToolMessage.
+        """
+        mock_subagent = RunnableLambda(
+            lambda _: {
+                "messages": [
+                    AIMessage(content="The real answer from the subagent."),
+                    AIMessage(content=""),
+                ],
+            }
+        )
+
+        parent_chat_model = GenericFakeChatModel(
+            messages=iter(
+                [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "task",
+                                "args": {
+                                    "description": "Do work",
+                                    "subagent_type": "worker",
+                                },
+                                "id": "call_trailing_empty",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    AIMessage(content="Done"),
+                ]
+            )
+        )
+
+        agent = create_deep_agent(
+            model=parent_chat_model,
+            checkpointer=InMemorySaver(),
+            subagents=[
+                CompiledSubAgent(
+                    name="worker",
+                    description="A worker agent",
+                    runnable=mock_subagent,
+                ),
+            ],
+        )
+
+        result = agent.invoke(
+            {"messages": [HumanMessage(content="Test")]},
+            config={"configurable": {"thread_id": f"test-trailing-empty-{uuid.uuid4().hex}"}},
+        )
+
+        tool_messages = [msg for msg in result["messages"] if msg.type == "tool"]
+        assert len(tool_messages) == 1
+        assert tool_messages[0].content == "The real answer from the subagent."
+
     def test_subagent_streaming_emits_messages_and_updates_from_subgraph(self) -> None:
         """Test end-to-end subagent streaming with `subgraphs=True`.
 
@@ -1415,6 +1521,186 @@ class TestSubAgents:
         assert saw_parent_model_update, "Should have seen the parent final model update in the stream"
         assert seen_agent_names == {"supervisor", "worker"}
 
+    def test_compiled_subagent_lc_agent_name_in_stream_metadata(self) -> None:
+        """lc_agent_name in streamed chunks must reflect the CompiledSubAgent's declared name.
+
+        Regression test for #2925: when a raw StateGraph (not created via create_agent)
+        is passed as a CompiledSubAgent, streamed chunks must carry the declared name in
+        metadata, not the parent agent's name.
+        """
+        subagent_content = "RAW_GRAPH_RESPONSE"
+
+        parent_chat_model = GenericFakeChatModel(
+            messages=iter(
+                [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "task",
+                                "args": {"description": "Do task", "subagent_type": "raw-worker"},
+                                "id": "call_raw_worker",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    AIMessage(content="Done."),
+                ]
+            ),
+            stream_delimiter="_",
+        )
+        subagent_chat_model = GenericFakeChatModel(
+            messages=iter([AIMessage(content=subagent_content)]),
+            stream_delimiter="_",
+        )
+
+        # Raw StateGraph — NOT created via create_agent, so no lc_agent_name pre-set.
+        builder = StateGraph(MessagesState)
+        builder.add_node("model", create_agent(model=subagent_chat_model))
+        builder.add_edge(START, "model")
+        raw_graph = builder.compile()
+
+        parent_agent = create_deep_agent(
+            model=parent_chat_model,
+            checkpointer=InMemorySaver(),
+            name="supervisor",
+            subagents=[CompiledSubAgent(name="raw-worker", description="Raw graph subagent.", runnable=raw_graph)],
+        )
+
+        seen_subagent_names: set[str | None] = set()
+
+        for _ns, stream_mode, data in parent_agent.stream(
+            {"messages": [HumanMessage(content="Do something")]},
+            stream_mode=["messages"],
+            subgraphs=True,
+            config={"configurable": {"thread_id": "test_raw_graph_lc_agent_name"}},
+        ):
+            if stream_mode == "messages":
+                message_chunk, metadata = data
+                if message_chunk.content:
+                    seen_subagent_names.add(metadata.get("lc_agent_name"))
+
+        assert "raw-worker" in seen_subagent_names, f"Expected 'raw-worker' in streamed lc_agent_name metadata, got: {seen_subagent_names}"
+
+    async def test_compiled_subagent_lc_agent_name_in_astream_metadata(self) -> None:
+        """Async variant of the #2925 streaming regression test.
+
+        The fix relies on `with_config` being symmetric across sync/async, but the
+        symptom in #2925 also shows up in `astream` — covering both paths guards
+        against an async-only regression.
+        """
+        subagent_content = "RAW_GRAPH_RESPONSE"
+
+        parent_chat_model = GenericFakeChatModel(
+            messages=iter(
+                [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "task",
+                                "args": {"description": "Do task", "subagent_type": "raw-worker"},
+                                "id": "call_raw_worker_async",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    AIMessage(content="Done."),
+                ]
+            ),
+            stream_delimiter="_",
+        )
+        subagent_chat_model = GenericFakeChatModel(
+            messages=iter([AIMessage(content=subagent_content)]),
+            stream_delimiter="_",
+        )
+
+        builder = StateGraph(MessagesState)
+        builder.add_node("model", create_agent(model=subagent_chat_model))
+        builder.add_edge(START, "model")
+        raw_graph = builder.compile()
+
+        parent_agent = create_deep_agent(
+            model=parent_chat_model,
+            checkpointer=InMemorySaver(),
+            name="supervisor",
+            subagents=[CompiledSubAgent(name="raw-worker", description="Raw graph subagent.", runnable=raw_graph)],
+        )
+
+        seen_subagent_names: set[str | None] = set()
+
+        async for _ns, stream_mode, data in parent_agent.astream(
+            {"messages": [HumanMessage(content="Do something")]},
+            stream_mode=["messages"],
+            subgraphs=True,
+            config={"configurable": {"thread_id": "test_raw_graph_lc_agent_name_async"}},
+        ):
+            if stream_mode == "messages":
+                message_chunk, metadata = data
+                if message_chunk.content:
+                    seen_subagent_names.add(metadata.get("lc_agent_name"))
+
+        assert "raw-worker" in seen_subagent_names, f"Expected 'raw-worker' in async streamed lc_agent_name metadata, got: {seen_subagent_names}"
+
+    def test_compiled_subagent_name_overrides_inner_runnable_name_in_stream(self) -> None:
+        """CompiledSubAgent.name takes precedence over the inner runnable's lc_agent_name in streamed chunks.
+
+        When the inner runnable was itself created via `create_agent(name=...)`, the
+        registered `CompiledSubAgent.name` is what the parent uses to reference the
+        subagent and what tracing consumers display. This precedence is verified at
+        the tool-runtime layer in `test_subagent_propagates_recursion_limit_to_tool_runtime`;
+        this test pins the same precedence in the streamed-chunk metadata surface
+        from #2925 so a future "fix" that swaps merge order can't silently regress it.
+        """
+        parent_chat_model = GenericFakeChatModel(
+            messages=iter(
+                [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "task",
+                                "args": {"description": "Do task", "subagent_type": "outer-name"},
+                                "id": "call_named_inner",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    AIMessage(content="Done."),
+                ]
+            ),
+            stream_delimiter="_",
+        )
+        subagent_chat_model = GenericFakeChatModel(
+            messages=iter([AIMessage(content="NAMED_INNER_RESPONSE")]),
+            stream_delimiter="_",
+        )
+
+        named_inner = create_agent(model=subagent_chat_model, name="inner-name")
+
+        parent_agent = create_deep_agent(
+            model=parent_chat_model,
+            checkpointer=InMemorySaver(),
+            name="supervisor",
+            subagents=[CompiledSubAgent(name="outer-name", description="Subagent with a different inner name.", runnable=named_inner)],
+        )
+
+        seen_subagent_names: set[str | None] = set()
+
+        for _ns, stream_mode, data in parent_agent.stream(
+            {"messages": [HumanMessage(content="Do something")]},
+            stream_mode=["messages"],
+            subgraphs=True,
+            config={"configurable": {"thread_id": "test_outer_name_wins"}},
+        ):
+            if stream_mode == "messages":
+                message_chunk, metadata = data
+                if message_chunk.content:
+                    seen_subagent_names.add(metadata.get("lc_agent_name"))
+
+        assert "outer-name" in seen_subagent_names, f"Expected 'outer-name' in streamed lc_agent_name metadata, got: {seen_subagent_names}"
+        assert "inner-name" not in seen_subagent_names, f"Inner runnable's lc_agent_name leaked into stream metadata: {seen_subagent_names}"
+
     def test_config_passed_to_runnable_lambda_subagent(self) -> None:
         """Test that config (including tags) is passed to a RunnableLambda subagent.
 
@@ -1464,6 +1750,7 @@ class TestSubAgents:
         assert len(received_configs) > 0, "Lambda should have been invoked"
         assert all(t in received_configs[0].get("tags", []) for t in test_tags), f"Missing tags in config: {received_configs[0].get('tags')}"
 
+    @pytest.mark.filterwarnings("ignore:Pydantic serializer warnings:UserWarning")
     def test_context_passed_to_subagent_tool_runtime(self) -> None:
         """Test that context passed to main agent is available in subagent's ToolRuntime.context."""
         received_contexts: list[Any] = []
@@ -2256,3 +2543,212 @@ class TestSubAgents:
         tool_messages = [msg for msg in result["messages"] if msg.type == "tool"]
         assert len(tool_messages) == 1
         assert tool_messages[0].content == "Override response."
+
+    def test_ls_agent_type_is_trace_only_metadata(self) -> None:
+        """``ls_agent_type`` must reach LangSmith but not streamed callback metadata.
+
+        The task tool wraps each subagent invocation in a langsmith
+        `tracing_context` with `metadata={"ls_agent_type": "subagent"}` so
+        downstream LangSmith tracing can distinguish subagent runs from
+        root-agent runs. Because this metadata is set via langsmith's tracing
+        contextvar (not via RunnableConfig), it only reaches the
+        `LangChainTracer` — it is not added to the callback manager's
+        metadata and therefore does not leak into streamed callback events.
+        """
+        # Root model: first call emits a task tool call that dispatches to the
+        # subagent; subsequent calls return a final response.
+        root_model = _ScriptedChatModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "task",
+                            "args": {
+                                "description": "Do some work",
+                                "subagent_type": "test-worker",
+                            },
+                            "id": "call_test_worker",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="Done."),
+            ]
+        )
+        subagent_model = _ScriptedChatModel(responses=[AIMessage(content="Subagent completed the task.")])
+
+        # Capture streamed callback metadata per-run.
+        captured_callbacks: list[dict[str, Any]] = []
+
+        class CaptureHandler(BaseCallbackHandler):
+            def on_chain_start(
+                self,
+                serialized: dict[str, Any],
+                inputs: dict[str, Any],
+                *,
+                run_id: str,
+                parent_run_id: str | None = None,
+                tags: list[str] | None = None,
+                metadata: dict[str, Any] | None = None,
+                **kwargs: Any,
+            ) -> None:
+                captured_callbacks.append(
+                    {
+                        "name": kwargs.get("name") or (serialized or {}).get("name"),
+                        "metadata": metadata or {},
+                    }
+                )
+
+        mock_session = MagicMock()
+        mock_client = Client(session=mock_session, api_key="test", auto_batch_tracing=False)
+
+        agent = create_deep_agent(
+            model=root_model,
+            checkpointer=InMemorySaver(),
+            subagents=[
+                SubAgent(
+                    name="test-worker",
+                    description="A test worker subagent.",
+                    system_prompt="You are a test worker.",
+                    model=subagent_model,
+                )
+            ],
+        )
+
+        with tracing_context(client=mock_client, enabled=True):
+            agent.invoke(
+                {"messages": [HumanMessage(content="Please do some work")]},
+                config={
+                    "configurable": {"thread_id": "test_ls_agent_type"},
+                    "callbacks": [CaptureHandler()],
+                },
+            )
+
+        # The subagent path must have run (otherwise the trace-only check below
+        # is trivially true).
+        subagent_callback = next((c for c in captured_callbacks if c["name"] == "test-worker"), None)
+        assert subagent_callback is not None, f"Expected a 'test-worker' subagent callback, got names: {[c['name'] for c in captured_callbacks]}"
+
+        # (1) ls_agent_type must not leak into any streamed callback metadata.
+        for captured in captured_callbacks:
+            assert "ls_agent_type" not in captured["metadata"], (
+                f"ls_agent_type leaked into callback metadata for run {captured['name']!r}: {captured['metadata']}"
+            )
+
+        # (2) ls_agent_type='subagent' must reach the LangSmith tracer.
+        posts: list[dict[str, Any]] = []
+        for call in mock_session.request.mock_calls:
+            if call.args and call.args[0] == "POST":
+                body = json.loads(call.kwargs["data"])
+                posts.extend(body.get("post", []) if "post" in body else [body])
+
+        subagent_tracer_metadatas = [
+            post.get("extra", {}).get("metadata", {})
+            for post in posts
+            if post.get("extra", {}).get("metadata", {}).get("ls_agent_type") == "subagent"
+        ]
+        assert subagent_tracer_metadatas, (
+            f"Expected at least one LangSmith post with ls_agent_type='subagent'. "
+            f"Got tracer metadatas: "
+            f"{[p.get('extra', {}).get('metadata', {}) for p in posts]}"
+        )
+
+    async def test_ls_agent_type_is_trace_only_metadata_async(self) -> None:
+        """Async variant of `test_ls_agent_type_is_trace_only_metadata`.
+
+        Exercises the async `atask` code path in `_build_task_tool` to
+        ensure the tracing-context tagging works identically for
+        `ainvoke`-driven subagent calls.
+        """
+        root_model = _ScriptedChatModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "task",
+                            "args": {
+                                "description": "Do some work",
+                                "subagent_type": "test-worker",
+                            },
+                            "id": "call_test_worker",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="Done."),
+            ]
+        )
+        subagent_model = _ScriptedChatModel(responses=[AIMessage(content="Subagent completed the task.")])
+
+        captured_callbacks: list[dict[str, Any]] = []
+
+        class CaptureHandler(BaseCallbackHandler):
+            def on_chain_start(
+                self,
+                serialized: dict[str, Any],
+                inputs: dict[str, Any],
+                *,
+                run_id: str,
+                parent_run_id: str | None = None,
+                tags: list[str] | None = None,
+                metadata: dict[str, Any] | None = None,
+                **kwargs: Any,
+            ) -> None:
+                captured_callbacks.append(
+                    {
+                        "name": kwargs.get("name") or (serialized or {}).get("name"),
+                        "metadata": metadata or {},
+                    }
+                )
+
+        mock_session = MagicMock()
+        mock_client = Client(session=mock_session, api_key="test", auto_batch_tracing=False)
+
+        agent = create_deep_agent(
+            model=root_model,
+            checkpointer=InMemorySaver(),
+            subagents=[
+                SubAgent(
+                    name="test-worker",
+                    description="A test worker subagent.",
+                    system_prompt="You are a test worker.",
+                    model=subagent_model,
+                )
+            ],
+        )
+
+        with tracing_context(client=mock_client, enabled=True):
+            await agent.ainvoke(
+                {"messages": [HumanMessage(content="Please do some work")]},
+                config={
+                    "configurable": {"thread_id": "test_ls_agent_type_async"},
+                    "callbacks": [CaptureHandler()],
+                },
+            )
+
+        subagent_callback = next((c for c in captured_callbacks if c["name"] == "test-worker"), None)
+        assert subagent_callback is not None, f"Expected a 'test-worker' subagent callback, got names: {[c['name'] for c in captured_callbacks]}"
+
+        for captured in captured_callbacks:
+            assert "ls_agent_type" not in captured["metadata"], (
+                f"ls_agent_type leaked into callback metadata for run {captured['name']!r}: {captured['metadata']}"
+            )
+
+        posts: list[dict[str, Any]] = []
+        for call in mock_session.request.mock_calls:
+            if call.args and call.args[0] == "POST":
+                body = json.loads(call.kwargs["data"])
+                posts.extend(body.get("post", []) if "post" in body else [body])
+
+        subagent_tracer_metadatas = [
+            post.get("extra", {}).get("metadata", {})
+            for post in posts
+            if post.get("extra", {}).get("metadata", {}).get("ls_agent_type") == "subagent"
+        ]
+        assert subagent_tracer_metadatas, (
+            f"Expected at least one LangSmith post with ls_agent_type='subagent'. "
+            f"Got tracer metadatas: "
+            f"{[p.get('extra', {}).get('metadata', {}) for p in posts]}"
+        )

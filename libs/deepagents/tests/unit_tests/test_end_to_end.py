@@ -3,7 +3,7 @@
 import base64
 import json
 import warnings
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -12,13 +12,16 @@ import pytest
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelRequest, ModelResponse
 from langchain.tools import ToolRuntime
+from langchain_core.exceptions import ContextOverflowError
 from langchain_core.language_models import LanguageModelInput
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool, tool
+from langgraph.channels.delta import DeltaChannel
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.store.memory import InMemoryStore
+from pydantic import Field
 
 from deepagents.backends import CompositeBackend, FilesystemBackend
 from deepagents.backends.protocol import BackendProtocol, ExecuteResponse, SandboxBackendProtocol
@@ -26,8 +29,7 @@ from deepagents.backends.state import StateBackend
 from deepagents.backends.store import StoreBackend
 from deepagents.backends.utils import TOOL_RESULT_TOKEN_LIMIT, create_file_data
 from deepagents.graph import create_deep_agent
-from deepagents.middleware.filesystem import NUM_CHARS_PER_TOKEN
-from deepagents.middleware.permissions import FilesystemPermission
+from deepagents.middleware.filesystem import NUM_CHARS_PER_TOKEN, FilesystemPermission
 from deepagents.middleware.subagents import SubAgent  # noqa: TC001
 from deepagents.middleware.summarization import create_summarization_tool_middleware
 from tests.unit_tests.chat_model import GenericFakeChatModel as FakeChatModelWithHistory
@@ -91,6 +93,15 @@ def prepopulate_file(backend: BackendProtocol, file_path: str, content: str) -> 
 
 class FixedGenericFakeChatModel(GenericFakeChatModel):
     """Fixed version of GenericFakeChatModel that properly handles bind_tools."""
+
+    messages: Iterator[AIMessage | str] = Field(exclude=True)
+    """Override parent field to exclude from pydantic serialization.
+
+    Without this, LangSmith tracing (which dumps the model via
+    `model_dump(mode="json")`) consumes the iterator before `_generate`
+    pulls from it, exhausting the iterator and raising `StopIteration` on
+    the first real model call.
+    """
 
     def bind_tools(
         self,
@@ -560,7 +571,7 @@ class TestDeepAgentEndToEnd:
         content = str(capturing_middleware.captured_system_messages[0].content)
         assert "You are a helpful assistant." in content
         assert "Always be polite." in content
-        assert "You are a Deep Agent" in content
+        assert "You are a deep agent" in content
 
     def test_deep_agent_with_system_message_string_content(self) -> None:
         """Test that create_deep_agent accepts a SystemMessage with string content."""
@@ -580,7 +591,7 @@ class TestDeepAgentEndToEnd:
 
         content = str(capturing_middleware.captured_system_messages[0].content)
         assert "You are a helpful research assistant." in content
-        assert "You are a Deep Agent" in content
+        assert "You are a deep agent" in content
 
     def test_deep_agent_two_turns_no_initial_files(self) -> None:
         """Test deepagent with two conversation turns without specifying files on invoke.
@@ -2609,6 +2620,52 @@ class TestStateBackendConfigKeys:
 
         assert result["files"]["/injected.txt"]["content"] == "from middleware"
 
+    def test_state_backend_read_your_writes_within_one_tool_call(self) -> None:
+        """Write + read in the same tool call — read sees the pending write.
+
+        Both operations happen inside a single ToolNode superstep, so the
+        write is still in `task.writes` (not yet committed). `fresh=True`
+        in `_read_files` applies pending writes through the channel reducer,
+        giving read-your-writes semantics.
+        """
+        backend = StateBackend()
+
+        @tool
+        def write_then_read(path: str, content: str) -> str:
+            """Write a file via StateBackend, then immediately read it back."""
+            backend.write(path, content)
+            result = backend.read(path)
+            if result.error:
+                return f"ERROR: {result.error}"
+            file_data = result.file_data or {}
+            return str(file_data.get("content", ""))
+
+        model = FixedGenericFakeChatModel(
+            messages=iter(
+                [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "write_then_read",
+                                "args": {"path": "/pending.txt", "content": "buffered"},
+                                "id": "call_wr",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    AIMessage(content="Done."),
+                ]
+            )
+        )
+
+        agent = create_deep_agent(model=model, backend=backend, tools=[write_then_read])
+        result = agent.invoke({"messages": [HumanMessage(content="go")]})
+
+        tool_msg = next(m for m in result["messages"] if m.type == "tool" and m.tool_call_id == "call_wr")
+        assert "buffered" in tool_msg.content
+        assert "ERROR" not in tool_msg.content
+
 
 class TestArtifactsRoot:
     """Test that artifacts_root on CompositeBackend parameterizes internal paths."""
@@ -3426,3 +3483,318 @@ class TestAsyncSubagentEndToEnd:
 
         async_tasks = result.get("async_tasks", {})
         assert async_tasks["thread_err"]["status"] == "error"
+
+
+class TestDeltaChannels:
+    """Verify that messages and files use DeltaChannel.
+
+    DeltaChannel stores individual writes in the `writes` table rather than
+    snapshotting the full accumulated value into `channel_values` on every
+    checkpoint step. This keeps checkpoint blobs small (O(1) per step instead
+    of O(N) for messages). The full state is still reconstructable via
+    `agent.get_state()`, which replays writes through the reducer.
+    """
+
+    def test_messages_uses_delta_channel(self) -> None:
+        """Messages channel must be a DeltaChannel in the compiled graph."""
+        fake_model = FakeChatModelWithHistory(messages=iter([AIMessage(content="Hello!")]))
+        agent = create_deep_agent(model=fake_model)
+
+        assert isinstance(agent.channels.get("messages"), DeltaChannel), "messages must use DeltaChannel so checkpoint growth is O(N) not O(N²)"
+
+    def test_messages_reconstructed_via_get_state(self) -> None:
+        """get_state() must reconstruct messages correctly despite DeltaChannel."""
+        fake_model = FakeChatModelWithHistory(messages=iter([AIMessage(content="Hello!")]))
+        checkpointer = InMemorySaver()
+        agent = create_deep_agent(model=fake_model, checkpointer=checkpointer)
+
+        config: dict = {"configurable": {"thread_id": "delta-messages-reconstruct"}}
+        agent.invoke({"messages": [HumanMessage(content="Hi")]}, config)
+
+        state = agent.get_state(config)
+        msgs = state.values["messages"]
+        assert len(msgs) >= 2
+        assert any(isinstance(m, HumanMessage) for m in msgs)
+        assert any(isinstance(m, AIMessage) for m in msgs)
+
+    def test_files_not_in_channel_values(self) -> None:
+        """Files should not appear in checkpoint channel_values (DeltaChannel)."""
+        fake_model = FakeChatModelWithHistory(
+            messages=iter(
+                [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "id": "call_1",
+                                "name": "write_file",
+                                "args": {"file_path": "hello.txt", "content": "hello"},
+                            }
+                        ],
+                    ),
+                    AIMessage(content="Done."),
+                ]
+            )
+        )
+        backend = StateBackend()
+        checkpointer = InMemorySaver()
+        agent = create_deep_agent(model=fake_model, backend=backend, checkpointer=checkpointer)
+
+        config: dict = {"configurable": {"thread_id": "delta-files"}}
+        agent.invoke({"messages": [HumanMessage(content="Write a file")]}, config)
+
+        checkpoint = checkpointer.get(config)
+        assert checkpoint is not None
+        # DeltaChannel: full files dict is NOT snapshotted into channel_values on every step
+        assert "files" not in checkpoint["channel_values"], (
+            "files is a DeltaChannel and should not appear in channel_values; it should be reconstructed from writes"
+        )
+
+    def test_files_reconstructed_via_get_state(self) -> None:
+        """get_state() must reconstruct files correctly despite DeltaChannel."""
+        fake_model = FakeChatModelWithHistory(
+            messages=iter(
+                [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "id": "call_1",
+                                "name": "write_file",
+                                "args": {"file_path": "hello.txt", "content": "hello"},
+                            }
+                        ],
+                    ),
+                    AIMessage(content="Done."),
+                ]
+            )
+        )
+        backend = StateBackend()
+        checkpointer = InMemorySaver()
+        agent = create_deep_agent(model=fake_model, backend=backend, checkpointer=checkpointer)
+
+        config: dict = {"configurable": {"thread_id": "delta-files-reconstruct"}}
+        agent.invoke({"messages": [HumanMessage(content="Write a file")]}, config)
+
+        state = agent.get_state(config)
+        files = state.values.get("files", {})
+        assert any("hello.txt" in k for k in files)
+
+
+def test_invalid_tool_call_patched_on_next_turn() -> None:
+    # Turn 1: model truncates and emits an invalid tool call (no matching ToolMessage
+    # will be produced because agents only route on ``tool_calls``).
+    # Turn 2: the middleware must patch the dangling call before the model is re-invoked.
+    fake_model = FakeChatModelWithHistory(
+        messages=iter(
+            [
+                AIMessage(
+                    content="",
+                    invalid_tool_calls=[
+                        {
+                            "id": "call_truncated",
+                            "name": "search",
+                            "args": '{"query": "weath',
+                            "error": "Unterminated string at line 1 column 17",
+                            "type": "invalid_tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="Recovered."),
+            ]
+        )
+    )
+    checkpointer = InMemorySaver()
+    agent = create_deep_agent(model=fake_model, checkpointer=checkpointer)
+    config: dict = {"configurable": {"thread_id": "patch-invalid-tool-calls"}}
+
+    agent.invoke({"messages": [HumanMessage(content="Run a tool")]}, config)
+    result = agent.invoke({"messages": [HumanMessage(content="Try again")]}, config)
+
+    # The second model call must see the dangling invalid_tool_call paired with a ToolMessage.
+    second_call_inputs = fake_model.call_history[1]["messages"]
+    synthetic = next(
+        (m for m in second_call_inputs if isinstance(m, ToolMessage) and m.tool_call_id == "call_truncated"),
+        None,
+    )
+    assert synthetic is not None, "PatchToolCallsMiddleware did not inject a ToolMessage for invalid_tool_calls"
+    assert "could not be executed" in synthetic.content
+    assert "malformed or truncated" in synthetic.content
+    assert synthetic.name == "search"
+
+    # Final state must also expose the patched ToolMessage.
+    assert any(isinstance(m, ToolMessage) and m.tool_call_id == "call_truncated" for m in result["messages"])
+
+
+_OVERFLOW_INPUT_CHAR_THRESHOLD = 50_000
+
+
+class _OverflowOnLargeInputModel(FakeChatModelWithHistory):
+    """Raises `ContextOverflowError` on any call whose input exceeds the char threshold.
+
+    Calls below the threshold pass through to the iterator (initial agent call,
+    summary-generation calls, post-clip retry). Raising on every over-threshold
+    call -- including the retry -- gives tests a built-in correctness check:
+    if clipping fails to reduce input below the threshold, the retry raises
+    and the test fails visibly.
+    """
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs: Any):  # type: ignore[override]
+        total_chars = sum(len(m.content) for m in messages if isinstance(m.content, str))
+        if total_chars > _OVERFLOW_INPUT_CHAR_THRESHOLD:
+            self.call_history.append(
+                {"messages": messages, "kwargs": {"stop": stop, "run_manager": run_manager, **kwargs}, "tools": self.tools, "raised": True}
+            )
+            msg = "simulated overflow"
+            raise ContextOverflowError(msg)
+        return super()._generate(messages, stop, run_manager, **kwargs)
+
+
+def _make_parallel_tool_tail(
+    tool_name: str,
+    per_tm_chars: int,
+    n_tools: int = 4,
+    args_builder: Callable[[int], dict[str, Any]] | None = None,
+) -> list[Any]:
+    """Build [Human, AI(n_tools `tool_name` calls), n_tools x ToolMessage(per_tm_chars)].
+
+    Args:
+        tool_name: The tool name to use in each emitted tool_call.
+        per_tm_chars: Char length of each ToolMessage's content (all 'x').
+        n_tools: Number of parallel tool calls in the AI message.
+        args_builder: Optional `i -> args dict` mapper. Defaults to an empty args dict.
+    """
+    tool_call_ids = [f"tc_{i}" for i in range(n_tools)]
+    args_fn = args_builder if args_builder is not None else (lambda _i: {})
+    ai_msg = AIMessage(
+        content="",
+        tool_calls=[{"id": tcid, "name": tool_name, "args": args_fn(i), "type": "tool_call"} for i, tcid in enumerate(tool_call_ids)],
+    )
+    tool_msgs = [ToolMessage(content="x" * per_tm_chars, tool_call_id=tcid, name=tool_name) for tcid in tool_call_ids]
+    return [HumanMessage(content="query"), ai_msg, *tool_msgs]
+
+
+def test_summarization_clips_read_file_batch_on_overflow() -> None:
+    """End-to-end: 4 parallel real `read_file` calls hit pre-populated big files in state, then the clip path slices each.
+
+    Pre-populates `state["files"]` with 4 large files, has the fake model emit
+    4 parallel `read_file` tool_calls, lets the real `read_file` tool execute
+    against `StateBackend`, then triggers the overflow path and verifies:
+
+    - Each TM in state ends up as the read_file-specific slice (head + path
+      pointer to the original file).
+    - No `/large_tool_results/` files are written -- read_file's full content
+      already lives on the backend at the agent-passed path.
+    - The original files in state are untouched.
+    """
+    big_content = "\n".join(f"line {i}: " + "x" * 200 for i in range(120))  # ~25k chars, multi-line
+    initial_files = {f"/big_{i}.txt": {**create_file_data(big_content)} for i in range(4)}
+
+    fake_model = _OverflowOnLargeInputModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"id": f"tc_{i}", "name": "read_file", "args": {"file_path": f"/big_{i}.txt"}, "type": "tool_call"} for i in range(4)
+                    ],
+                ),
+                AIMessage(content="summary text"),
+                AIMessage(content="final response"),
+            ]
+        )
+    )
+    fake_model.call_history = []
+    fake_model.profile = {"max_input_tokens": 200_000}
+
+    agent = create_deep_agent(model=fake_model, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "real-read-file-clip-test"}}
+
+    result = agent.invoke(
+        {"messages": [HumanMessage(content="read the files")], "files": initial_files},
+        config,
+    )
+
+    assert result["messages"][-1].content == "final response"
+
+    # Each ToolMessage in state should be the read_file-specific slice replacement.
+    state_tool_msgs = [m for m in result["messages"] if isinstance(m, ToolMessage)]
+    assert len(state_tool_msgs) == 4
+    for i, tm in enumerate(state_tool_msgs):
+        assert "Tool result too large" not in tm.content
+        assert f"/big_{i}.txt" in tm.content
+        assert "Output was truncated due to context window size limits" in tm.content
+        assert "Use read_file with offset and limit" in tm.content
+        # Sliced content is smaller than the original file.
+        assert len(tm.content) < len(big_content)
+
+    # No per-TM offload files were written -- read_file's full content is at the original path.
+    state = agent.get_state(config)
+    files = state.values.get("files", {})
+    assert not any(k.startswith("/large_tool_results/") for k in files)
+    # Original files are still intact.
+    for i in range(4):
+        assert f"/big_{i}.txt" in files
+
+
+def test_summarization_clips_ls_batch_on_overflow() -> None:
+    """On overflow with 4 parallel `ls` results, each TM is evicted via the generic offload.
+
+    `ls` isn't read_file, so the tail-clip path falls through to
+    `_offload_tool_message_content`: full content written under
+    `/large_tool_results/{tcid}` and the message replaced with a
+    `TOO_LARGE_TOOL_MSG` stub.
+    """
+    fake_model = _OverflowOnLargeInputModel(messages=iter([AIMessage(content="summary text"), AIMessage(content="final response")]))
+    fake_model.call_history = []
+    fake_model.profile = {"max_input_tokens": 200_000}
+
+    agent = create_deep_agent(model=fake_model, checkpointer=InMemorySaver())
+
+    input_messages = _make_parallel_tool_tail(
+        tool_name="ls",
+        per_tm_chars=25_000,
+        n_tools=4,
+        args_builder=lambda i: {"path": f"/dir_{i}"},
+    )
+    config = {"configurable": {"thread_id": "clip-ls-test"}}
+    result = agent.invoke({"messages": input_messages}, config)
+
+    assert len(fake_model.call_history) == 3
+    state_tool_msgs = [m for m in result["messages"] if isinstance(m, ToolMessage)]
+    assert len(state_tool_msgs) == 4
+    for tm in state_tool_msgs:
+        assert "Tool result too large" in tm.content
+        assert "/large_tool_results/" in tm.content
+
+    state = agent.get_state(config)
+    files = state.values.get("files", {})
+    for tcid in ("tc_0", "tc_1", "tc_2", "tc_3"):
+        assert f"/large_tool_results/{tcid}" in files, f"missing offload file for {tcid}"
+
+
+def test_summarization_clips_vanilla_tool_batch_on_overflow() -> None:
+    """On overflow with 4 parallel calls to an arbitrary user tool, each TM is evicted.
+
+    Same expected behavior as the `ls` test -- any non-read_file tool name routes
+    through the generic offload path.
+    """
+    fake_model = _OverflowOnLargeInputModel(messages=iter([AIMessage(content="summary text"), AIMessage(content="final response")]))
+    fake_model.call_history = []
+    fake_model.profile = {"max_input_tokens": 200_000}
+
+    agent = create_deep_agent(model=fake_model, checkpointer=InMemorySaver())
+
+    input_messages = _make_parallel_tool_tail(
+        tool_name="vendor_lookup",
+        per_tm_chars=25_000,
+        n_tools=4,
+        args_builder=lambda i: {"vendor_id": f"v_{i}"},
+    )
+    config = {"configurable": {"thread_id": "clip-vanilla-test"}}
+    _ = agent.invoke({"messages": input_messages}, config)
+
+    state = agent.get_state(config)
+    files = state.values.get("files", {})
+    for tcid in ("tc_0", "tc_1", "tc_2", "tc_3"):
+        assert f"/large_tool_results/{tcid}" in files, f"missing offload file for {tcid}"
